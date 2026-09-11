@@ -340,7 +340,7 @@ async def test_switch_off_on_off_survives_repeated_stale_on_polls(
             state = hass.states.get(entity_id)
             assert state.state == "off"
             assert coordinator.is_pending_confirmation("aux2_on") is True
-            assert coordinator._aux_state[2] is False
+            assert coordinator._aux_state[2] is True
 
         coordinator._reconcile_unsub()
         coordinator._reconcile_unsub = None

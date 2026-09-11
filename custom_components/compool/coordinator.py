@@ -202,9 +202,9 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             status = await self.hass.async_add_executor_job(
                 self._get_pool_status_with_retry
             )
-        status = self._reconcile_pending_status(status)
-        self._capture_aux_state(status)
-        return status
+            # Toggle decisions must use the reported state, never the UI overlay.
+            self._capture_aux_state(status)
+        return self._reconcile_pending_status(status)
 
     def _capture_aux_state(self, status: dict[str, Any]) -> None:
         """Record the hardware-truth aux states reported by a poll.

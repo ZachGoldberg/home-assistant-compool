@@ -325,12 +325,12 @@ async def test_aux_off_survives_repeated_stale_on_polls(
         first_stale = await coordinator._async_update_data()
         assert first_stale["aux1_on"] is False
         assert coordinator.is_pending_confirmation("aux1_on") is True
-        assert coordinator._aux_state[1] is False
+        assert coordinator._aux_state[1] is True
 
         second_stale = await coordinator._async_update_data()
         assert second_stale["aux1_on"] is False
         assert coordinator.is_pending_confirmation("aux1_on") is True
-        assert coordinator._aux_state[1] is False
+        assert coordinator._aux_state[1] is True
 
         confirmed_off = await coordinator._async_update_data()
         assert confirmed_off["aux1_on"] is False
@@ -447,7 +447,7 @@ async def test_stale_poll_preserves_optimistic_on(hass: HomeAssistant) -> None:
 
         stale = await coordinator._async_update_data()
         assert stale["aux1_on"] is True
-        assert coordinator._aux_state[1] is True
+        assert coordinator._aux_state[1] is False
         assert coordinator.is_pending_confirmation("aux1_on") is True
 
         confirmed = await coordinator._async_update_data()
@@ -500,3 +500,49 @@ async def test_shutdown_cancels_pending_writes(hass: HomeAssistant) -> None:
 
         await flush_writes(hass)
         mock_set.assert_not_called()
+
+
+@pytest.mark.parametrize(("aux_num", "initial"), [(1, True), (2, False)])
+@pytest.mark.parametrize("first_success", [False, True])
+async def test_aux_retry_after_unconfirmed_write(
+    hass: HomeAssistant, aux_num: int, initial: bool, first_success: bool
+) -> None:
+    """An optimistic poll must not suppress a retry of an unconfirmed command."""
+    coordinator = _make_coordinator(hass)
+    key = f"aux{aux_num}_on"
+    status = {**MOCK_POOL_STATUS, key: initial}
+    coordinator.data = dict(status)
+    coordinator._capture_aux_state(status)
+
+    with patch("custom_components.compool.coordinator.PoolController") as mock_ctrl:
+        mock_ctrl.return_value.get_status.return_value = dict(status)
+        mock_ctrl.return_value.toggle_aux_equipment.side_effect = [first_success, True]
+        await coordinator.async_set_aux_equipment(aux_num, not initial)
+        await flush_writes(hass)
+        await flush_reconcile(hass)
+
+        assert coordinator.data[key] is not initial
+        assert coordinator._aux_state[aux_num] is initial
+        await coordinator.async_set_aux_equipment(aux_num, not initial)
+        await flush_writes(hass)
+        assert mock_ctrl.return_value.toggle_aux_equipment.call_count == 2
+
+    await coordinator.async_shutdown()
+
+
+async def test_aux_poll_before_flush_does_not_skip_write(hass: HomeAssistant) -> None:
+    """A poll during batching cannot turn a queued off command into a no-op."""
+    coordinator = _make_coordinator(hass)
+    coordinator.data = dict(MOCK_POOL_STATUS)
+    coordinator._capture_aux_state(MOCK_POOL_STATUS)
+
+    with patch("custom_components.compool.coordinator.PoolController") as mock_ctrl:
+        mock_ctrl.return_value.get_status.return_value = dict(MOCK_POOL_STATUS)
+        mock_ctrl.return_value.toggle_aux_equipment.return_value = True
+        await coordinator.async_set_aux_equipment(1, False)
+        await coordinator.async_refresh()
+        assert coordinator.data["aux1_on"] is False
+        await flush_writes(hass)
+        mock_ctrl.return_value.toggle_aux_equipment.assert_called_once_with(1)
+
+    await coordinator.async_shutdown()
