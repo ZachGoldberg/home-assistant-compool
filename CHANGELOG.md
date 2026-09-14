@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Pin the Home Assistant test plugin to the integration's Home Assistant version, refresh the committed lockfile, and require it in local checks to prevent dependency drift from causing false teardown failures.
+
 ## [0.7.0] - 2026-09-14
 
 ### Fixed

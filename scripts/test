@@ -4,5 +4,6 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-# Run tests using uv run for better environment isolation
-uv run pytest tests/ -v
+# Refuse to silently replace the Home Assistant test stack. The plugin is
+# generated for a specific Home Assistant release and must stay in lockstep.
+uv run --locked pytest tests/ -v
