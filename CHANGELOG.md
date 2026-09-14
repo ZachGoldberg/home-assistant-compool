@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-14
+
 ### Fixed
 - Prevent repeated auxiliary requests from sending another toggle while the prior hardware outcome is unresolved.
 - Compose pool and spa heater modes into one shared protocol-field update so stale reads cannot erase the other setting.
