@@ -4,6 +4,6 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-# Use uv run for better environment isolation
-uv run ruff format .
-uv run ruff check . --fix
+# Keep local checks on the same dependency graph as CI.
+uv run --locked ruff format .
+uv run --locked ruff check . --fix
