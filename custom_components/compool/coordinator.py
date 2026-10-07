@@ -60,6 +60,11 @@ class PendingWrite:
 type CompoolConfigEntry = ConfigEntry[CompoolRuntimeData]
 
 
+# How long a missed poll may reuse the last good status before entities go
+# unavailable: covers one or two dropped polls at the ~30 s scan interval.
+STALE_STATUS_GRACE_SECONDS = 90
+
+
 class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Data update coordinator for pool controller status."""
 
@@ -86,6 +91,11 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._device = f"socket://{host}:{port}"
         self._consecutive_failures = 0
         self._last_failure_time = 0
+        # Keep showing the last good status through a missed poll or two (the
+        # RS485 bridge occasionally drops one), instead of flashing every entity
+        # unavailable for a poll interval.
+        self._last_success_monotonic: float | None = None
+        self._stale_misses = 0
 
         # Serialize every transaction on the half-duplex RS485 bus: only one
         # poll or write may touch the controller at a time.
@@ -218,9 +228,28 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Update pool controller status."""
         async with self._io_lock:
-            status = await self.hass.async_add_executor_job(
-                self._get_pool_status_with_retry
-            )
+            try:
+                status = await self.hass.async_add_executor_job(
+                    self._get_pool_status_with_retry
+                )
+            except UpdateFailed:
+                if (
+                    self.data
+                    and self._last_success_monotonic is not None
+                    and time.monotonic() - self._last_success_monotonic
+                    < STALE_STATUS_GRACE_SECONDS
+                ):
+                    self._stale_misses += 1
+                    _LOGGER.info(
+                        "Pool controller missed a status poll (%d in a row); "
+                        "keeping the last status from %.0f s ago",
+                        self._stale_misses,
+                        time.monotonic() - self._last_success_monotonic,
+                    )
+                    return self.data
+                raise
+            self._last_success_monotonic = time.monotonic()
+            self._stale_misses = 0
             # Toggle decisions must use the reported state, never the UI overlay.
             self._capture_aux_state(status)
         return self._reconcile_pending_status(status)
