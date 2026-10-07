@@ -47,6 +47,7 @@ class PendingConfirmation:
     requested_at: float
     stale_reconcile_count: int = 0
     generation: int = 0
+    unacknowledged: bool = False
 
 
 @dataclass
@@ -58,6 +59,11 @@ class PendingWrite:
 
 
 type CompoolConfigEntry = ConfigEntry[CompoolRuntimeData]
+
+
+# How long a missed poll may reuse the last good status before entities go
+# unavailable: covers one or two dropped polls at the ~30 s scan interval.
+STALE_STATUS_GRACE_SECONDS = 90
 
 
 class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -86,6 +92,11 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._device = f"socket://{host}:{port}"
         self._consecutive_failures = 0
         self._last_failure_time = 0
+        # Keep showing the last good status through a missed poll or two (the
+        # RS485 bridge occasionally drops one), instead of flashing every entity
+        # unavailable for a poll interval.
+        self._last_success_monotonic: float | None = None
+        self._stale_misses = 0
 
         # Serialize every transaction on the half-duplex RS485 bus: only one
         # poll or write may touch the controller at a time.
@@ -108,6 +119,8 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # unresolved. The latest desired state is retained for a later poll.
         self._aux_desired: dict[int, bool] = {}
         self._aux_unresolved: dict[int, PendingConfirmation] = {}
+        self._aux_fast_retried: set[int] = set()
+        self._reconciling = False
         self._heat_source_byte = 0
 
     def _new_controller(self) -> PoolController:
@@ -218,9 +231,28 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Update pool controller status."""
         async with self._io_lock:
-            status = await self.hass.async_add_executor_job(
-                self._get_pool_status_with_retry
-            )
+            try:
+                status = await self.hass.async_add_executor_job(
+                    self._get_pool_status_with_retry
+                )
+            except UpdateFailed:
+                if (
+                    self.data
+                    and self._last_success_monotonic is not None
+                    and time.monotonic() - self._last_success_monotonic
+                    < STALE_STATUS_GRACE_SECONDS
+                ):
+                    self._stale_misses += 1
+                    _LOGGER.info(
+                        "Pool controller missed a status poll (%d in a row); "
+                        "keeping the last status from %.0f s ago",
+                        self._stale_misses,
+                        time.monotonic() - self._last_success_monotonic,
+                    )
+                    return self.data
+                raise
+            self._last_success_monotonic = time.monotonic()
+            self._stale_misses = 0
             # Toggle decisions must use the reported state, never the UI overlay.
             self._capture_aux_state(status)
         return self._reconcile_pending_status(status)
@@ -242,7 +274,12 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     time.monotonic() - unresolved.requested_at
                     > OPTIMISTIC_CONFIRMATION_WINDOW_SECONDS
                 )
-                if value == unresolved.expected or expired:
+                # A toggle applied before this post-write poll would already be
+                # reported, so an unacknowledged one still in the old state failed.
+                failed = unresolved.unacknowledged and self._reconciling
+                if value == unresolved.expected or expired or failed:
+                    if failed:
+                        self._aux_fast_retried.add(aux_num)
                     self._aux_unresolved.pop(aux_num, None)
                     desired = self._aux_desired.get(aux_num, value)
                     if desired != value:
@@ -463,7 +500,11 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _reconcile(self, _now: Any) -> None:
         """Poll the controller to overwrite optimistic state with real status."""
         self._reconcile_unsub = None
-        await self.async_refresh()
+        self._reconciling = True
+        try:
+            await self.async_refresh()
+        finally:
+            self._reconciling = False
 
     async def async_shutdown(self) -> None:
         """Cancel any pending batched write and reconcile poll on unload."""
@@ -477,6 +518,7 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pending_confirmation.clear()
         self._aux_desired.clear()
         self._aux_unresolved.clear()
+        self._aux_fast_retried.clear()
         await super().async_shutdown()
 
     async def async_set_pool_temperature(
@@ -536,15 +578,16 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return True
         # Once attempted, the physical outcome is uncertain even if the
         # transport raises after writing or no valid acknowledgment arrives.
-        self._aux_unresolved[aux_num] = PendingConfirmation(
-            expected=state, requested_at=time.monotonic()
-        )
+        unresolved = PendingConfirmation(expected=state, requested_at=time.monotonic())
+        self._aux_unresolved[aux_num] = unresolved
         try:
             controller = self._new_controller()
             success = controller.toggle_aux_equipment(aux_num)
         except Exception as ex:
             _LOGGER.error("Error setting aux%d equipment: %s", aux_num, ex)
-            return False
+            success = False
+        if not success and aux_num not in self._aux_fast_retried:
+            unresolved.unacknowledged = True
         return success
 
     def _queue_aux_write(self, aux_num: int, state: bool) -> None:
@@ -558,6 +601,7 @@ class CompoolStatusDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_set_aux_equipment(self, aux_num: int, state: bool) -> None:
         """Set auxiliary equipment state."""
         self._aux_desired[aux_num] = state
+        self._aux_fast_retried.discard(aux_num)
         unresolved = self._aux_unresolved.get(aux_num)
         if unresolved is not None and unresolved.expected == state:
             return
